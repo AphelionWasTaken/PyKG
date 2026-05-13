@@ -7,6 +7,10 @@ Features:
 - Windows, Linux, and MacOS support
 - A clean and easy to use GUI
 - PARAM.SFO verification of PKG info
+- Recursive folder scanning
+<p align="center">
+  <img width="576" height="457" alt="image" src="https://github.com/user-attachments/assets/eb92ae51-b2d9-4eb6-bd6e-4a0cff8f2a7f" />
+</p>
 
 Installation
 ============
