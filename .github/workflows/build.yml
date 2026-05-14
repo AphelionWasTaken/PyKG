@@ -176,10 +176,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: v0.0.1
-          name: v0.0.1
+          tag_name: v0.0.2
+          name: v0.0.2
           body: |
-            Initial release.
+            Verify SHA-1 hashes of PKG files. Do not extract corrupt PKGs or any subequent PKGs for that title_id.
+
+            If you are extracting files to RPCS3, this will prevent corrupt updates and help enforce the correct installation order.
           draft: false
           prerelease: false
           files: |

@@ -3,6 +3,7 @@ import queue
 import sys
 import struct
 import threading
+import hashlib
 import customtkinter as ctk
 from tkinter import PhotoImage, filedialog
 from pathlib import Path
@@ -145,6 +146,43 @@ def find_title_id_and_version(f, items, iv, data_offset, log):
                 return tid, ver
     log("ERROR: PARAM.SFO DOES NOT CONTAIN ONE OF THE FOLLOWING: TITLE_ID or APP_VER")
     return None
+
+
+def verify_pkg_hash(pkg_path: Path, log_cb=None) -> tuple[bool, str]:
+    CHUNK = 512 * 1024
+    try:
+        file_size = pkg_path.stat().st_size
+    except OSError as e:
+        return False, f"Could not get file attributes: {e}"
+
+    if file_size < 32:
+        return False, "File too small to contain a PackageDigest"
+
+    body_size = file_size - 32
+    h = hashlib.sha1()
+    try:
+        with open(pkg_path, 'rb') as f:
+            remaining = body_size
+            while remaining > 0:
+                chunk = f.read(min(CHUNK, remaining))
+                if not chunk:
+                    break
+                h.update(chunk)
+                remaining -= len(chunk)
+            stored_hash = f.read(20)
+    except OSError as e:
+        return False, f"Could not read file: {e}"
+
+    if stored_hash == bytes(20):
+        return True, "No PackageDigest (homebrew PKG)"
+
+    computed_hash = h.digest()
+    if computed_hash == stored_hash:
+        return True, f"SHA-1 Hash: {computed_hash.hex()}"
+    else:
+        return False, (f"Hash MISMATCH!\n"
+                       f"stored: {stored_hash.hex()}\n"
+                       f"computed: {computed_hash.hex()}")
 
 def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) -> str:
     def log(msg: str):
@@ -377,6 +415,7 @@ class App(ctk.CTk):
         self.log_clear()
         self.clear_list()
         self._pkg_files = []
+        self._pkg_hash_ok = {}
         self.extract_btn.configure(state='disabled')
         self.progress.set(0)
 
@@ -388,15 +427,32 @@ class App(ctk.CTk):
 
         self._pkg_files = pkgs
         self.enqueue_log(f"Found {len(pkgs)} PKG file(s).\n\n")
+
+        hash_labels = []
         for pkg in pkgs:
             cid = peek_content_id(pkg)
-            self.add_list_item(pkg, cid)
+            hash_label = self.add_list_item(pkg, cid)
+            hash_labels.append(hash_label)
 
-        self.set_status(f"{len(pkgs)} PKG(s) ready.")
+        t = threading.Thread(target=self.scan_worker, args=(pkgs, hash_labels), daemon=True)
+        t.start()
+
+    def scan_worker(self, pkgs: list[Path], hash_labels: list):
+        total = len(pkgs)
+        for i, (pkg, hash_label) in enumerate(zip(pkgs, hash_labels), 1):
+            ok, msg = verify_pkg_hash(pkg)
+            self._pkg_hash_ok[pkg] = ok
+            color = 'green' if ok else 'red'
+            self.after(0, lambda lbl=hash_label, m=msg, c=color: lbl.configure(text=m, text_color=c))
+            self.after(0, self.progress.set, i / total)
+
+        self.set_status(f"{total} PKG(s) ready.")
+        self.after(0, self.progress.set, 0)
         if HAS_CRYPTO:
-            self.extract_btn.configure(state='normal')
+           self.after(0, lambda: self.extract_btn.configure(state='normal'))
         else:
             self.enqueue_log("Install pycryptodomex to enable extraction.\n")
+
 
     def start_extract(self):
         dest = self.dest_var.get().strip()
@@ -431,6 +487,7 @@ class App(ctk.CTk):
 
         pkg_meta = []
         ordered_pkgs = []
+        skipped_title_ids: set[str] = set()
 
         for i, pkg in enumerate(pkgs, 1):
             if self.cancel_flag.is_set():
@@ -482,6 +539,22 @@ class App(ctk.CTk):
                 self.enqueue_log(f"\nCancelled after {count-1}/{len(ordered_pkgs)} PKGs.\n")
                 break
 
+            if not self._pkg_hash_ok.get(pkg, False):
+                self.enqueue_log(f"\n[{count}/{len(ordered_pkgs)}] SKIPPED (hash mismatch): {pkg.name}\n")
+                for p, tid, version, _ in pkg_meta:
+                    if p == pkg:
+                        skipped_title_ids.add(tid)
+                        break
+                self.after(0, self.progress.set, count / len(ordered_pkgs))
+                continue
+
+            pkg_to_tid: dict[Path, str] = {p: tid for p, tid, version, _ in pkg_meta}
+            pkg_tid = pkg_to_tid.get(pkg)
+            if pkg_tid in skipped_title_ids:
+                self.enqueue_log(f"\n[{count}/{len(ordered_pkgs)}] SKIPPED (title ID {pkg_tid} has failed PKG): {pkg.name}\n")
+                self.after(0, self.progress.set, count / len(ordered_pkgs))
+                continue
+
             self.set_status(f"Extracting {count}/{len(ordered_pkgs)}…")
 
             self.enqueue_log(f"\n[{count}/{len(ordered_pkgs)}] {pkg.name}\n"
@@ -525,9 +598,15 @@ class App(ctk.CTk):
         ctk.CTkLabel(fr, text=f"ID: {cid}",
                      font=ctk.CTkFont(size=10), text_color='#00b8d9',
                      anchor='w').pack(fill='x', padx=8)
+        hash_label = ctk.CTkLabel(fr, text="Verifying Hash...",
+                     font=ctk.CTkFont(size=10), text_color='#00b8d9',
+                     anchor='w', justify='left')
+        hash_label.pack(fill='x', padx=8)
         ctk.CTkLabel(fr, text=str(p.parent),
                      font=ctk.CTkFont(size=10), text_color='#666',
-                     anchor='w', wraplength=270).pack(fill='x', padx=8, pady=(0, 4))
+                     anchor='w', wraplength=270, justify='left').pack(fill='x', padx=8, pady=(0, 4))
+        
+        return hash_label
 
     def set_status(self, msg: str):
         self.after(0, self.status_lbl.configure, {'text': msg})
