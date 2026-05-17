@@ -107,6 +107,8 @@ def parse_sfo(data: bytes) -> dict | None:
             result['TITLE_ID'] = value
         elif key == 'APP_VER':
             result['APP_VER'] = value
+        elif key == 'TITLE':
+            result['TITLE'] = value
 
     return result if 'TITLE_ID' in result else None
 
@@ -139,13 +141,15 @@ def find_title_id_and_version(f, items, iv, data_offset, log):
             if info:
                 tid = info.get('TITLE_ID')
                 ver = info.get('APP_VER')
+                title = info.get('TITLE', '')
 
+                log(f"TITLE: {title}\n")
                 log(f"TITLE_ID: {tid}\n")
                 log(f"APP_VER: {ver}\n")
 
-                return tid, ver
+                return tid, ver, title
     log("ERROR: PARAM.SFO DOES NOT CONTAIN ONE OF THE FOLLOWING: TITLE_ID or APP_VER")
-    return None
+    return None, None, None
 
 
 def verify_pkg_hash(pkg_path: Path, log_cb=None) -> tuple[bool, str]:
@@ -208,7 +212,7 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
             name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
             items.append((name_off, name_size, item_data_off, item_data_size, flags))
 
-        title_id, app_ver = find_title_id_and_version(f, items, iv, data_offset, log)
+        title_id, app_ver, title = find_title_id_and_version(f, items, iv, data_offset, log)
         title_id = str(title_id)
         CHUNK = 512 * 1024
 
@@ -429,15 +433,17 @@ class App(ctk.CTk):
         self.enqueue_log(f"Found {len(pkgs)} PKG file(s).\n\n")
 
         hash_labels = []
+        meta_labels = []
         for pkg in pkgs:
             cid = peek_content_id(pkg)
-            hash_label = self.add_list_item(pkg, cid)
+            hash_label, meta_label = self.add_list_item(pkg, cid)
             hash_labels.append(hash_label)
+            meta_labels.append(meta_label)
 
-        t = threading.Thread(target=self.scan_worker, args=(pkgs, hash_labels), daemon=True)
+        t = threading.Thread(target=self.scan_worker, args=(pkgs, hash_labels, meta_labels), daemon=True)
         t.start()
 
-    def scan_worker(self, pkgs: list[Path], hash_labels: list):
+    def scan_worker(self, pkgs: list[Path], hash_labels: list, meta_labels: list):
         total = len(pkgs)
         for i, (pkg, hash_label) in enumerate(zip(pkgs, hash_labels), 1):
             ok, msg = verify_pkg_hash(pkg)
@@ -445,6 +451,24 @@ class App(ctk.CTk):
             color = 'green' if ok else 'red'
             self.after(0, lambda lbl=hash_label, m=msg, c=color: lbl.configure(text=m, text_color=c))
             self.after(0, self.progress.set, i / total)
+
+            try:
+                with open(pkg, 'rb') as f:
+                    hdr = read_header(f)
+                    table_raw = decrypt_region(f, hdr['iv'], hdr['data_offset'], 0, hdr['item_count'] * ITEM_RECORD_SIZE)
+                    items = []
+                    for j in range(hdr['item_count']):
+                        rec = table_raw[j * ITEM_RECORD_SIZE:(j + 1) * ITEM_RECORD_SIZE]
+                        name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
+                        items.append((name_off, name_size, item_data_off, item_data_size, flags))
+                    tid, version, title = find_title_id_and_version(f, items, hdr['iv'], hdr['data_offset'], lambda x: None)
+                lbl = meta_labels[i - 1]
+                text = f"{title} \n{tid} | {version}"
+                self.after(0, lambda l=lbl, t=text: l.configure(text=t))
+            except Exception:
+                pass
+
+        self._meta_labels: dict[Path, ctk.CTkLabel] = dict(zip(pkgs, meta_labels))
 
         self.set_status(f"{total} PKG(s) ready.")
         self.after(0, self.progress.set, 0)
@@ -511,16 +535,16 @@ class App(ctk.CTk):
                         name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
                         items.append((name_off, name_size, item_data_off, item_data_size, flags))
 
-                    tid, version = find_title_id_and_version(f, items, iv, data_offset, lambda x: None)
-                    pkg_meta.append((pkg, tid, version, parse_version(version)))
+                    tid, version, title = find_title_id_and_version(f, items, iv, data_offset, lambda x: None)
+                    pkg_meta.append((pkg, title, tid, version, parse_version(version)))
 
             except Exception as e:
                 self.enqueue_log(f"scan failed: {pkg.name}: {e}\n")
-                pkg_meta.append((pkg, 'UNKNOWN', (0, 0)))
+                pkg_meta.append((pkg, 'UNKNOWN', 'UNKNOWN', (0, 0)))
 
         groups = defaultdict(list)
 
-        for pkg, tid, version, ver in pkg_meta:
+        for pkg, title, tid, version, ver in pkg_meta:
             groups[tid].append((pkg, version, ver))
 
         for tid in groups:
@@ -541,14 +565,14 @@ class App(ctk.CTk):
 
             if not self._pkg_hash_ok.get(pkg, False):
                 self.enqueue_log(f"\n[{count}/{len(ordered_pkgs)}] SKIPPED (hash mismatch): {pkg.name}\n")
-                for p, tid, version, _ in pkg_meta:
+                for p, title, tid, version, _ in pkg_meta:
                     if p == pkg:
                         skipped_title_ids.add(tid)
                         break
                 self.after(0, self.progress.set, count / len(ordered_pkgs))
                 continue
 
-            pkg_to_tid: dict[Path, str] = {p: tid for p, tid, version, _ in pkg_meta}
+            pkg_to_tid: dict[Path, str] = {p: tid for p, title, tid, version, _ in pkg_meta}
             pkg_tid = pkg_to_tid.get(pkg)
             if pkg_tid in skipped_title_ids:
                 self.enqueue_log(f"\n[{count}/{len(ordered_pkgs)}] SKIPPED (title ID {pkg_tid} has failed PKG): {pkg.name}\n")
@@ -589,24 +613,23 @@ class App(ctk.CTk):
             w.destroy()
 
     def add_list_item(self, p: Path, cid: str):
-        fr = ctk.CTkFrame(self.list_frame,
-                          fg_color=('gray83', 'gray22'), corner_radius=4)
+        fr = ctk.CTkFrame(self.list_frame, fg_color=('gray83', 'gray22'), corner_radius=4)
         fr.pack(fill='x', pady=2, padx=2)
-        ctk.CTkLabel(fr, text=p.name,
-                     font=ctk.CTkFont(family=MONO_FONT, size=11),
-                     anchor='w').pack(fill='x', padx=8, pady=(4, 0))
-        ctk.CTkLabel(fr, text=f"ID: {cid}",
-                     font=ctk.CTkFont(size=10), text_color='#00b8d9',
-                     anchor='w').pack(fill='x', padx=8)
+        meta_label = ctk.CTkLabel(fr, text="", font=ctk.CTkFont(size=11),
+                    anchor='w', justify='left')
+        meta_label.pack(fill='x', padx=8, pady=(4,0))
+        ctk.CTkLabel(fr, text=p.name, font=ctk.CTkFont(size=10),
+                    anchor='w').pack(fill='x', padx=8, pady=(4, 0))
         hash_label = ctk.CTkLabel(fr, text="Verifying Hash...",
-                     font=ctk.CTkFont(size=10), text_color='#00b8d9',
-                     anchor='w', justify='left')
+                    font=ctk.CTkFont(size=10), text_color="#ced900",
+                    anchor='w', justify='left')
         hash_label.pack(fill='x', padx=8)
         ctk.CTkLabel(fr, text=str(p.parent),
-                     font=ctk.CTkFont(size=10), text_color='#666',
-                     anchor='w', wraplength=270, justify='left').pack(fill='x', padx=8, pady=(0, 4))
+                    font=ctk.CTkFont(size=10), text_color='#666',
+                    anchor='w', wraplength=270, justify='left').pack(fill='x', padx=8, pady=(0, 4))
+
         
-        return hash_label
+        return hash_label, meta_label
 
     def set_status(self, msg: str):
         self.after(0, self.status_lbl.configure, {'text': msg})

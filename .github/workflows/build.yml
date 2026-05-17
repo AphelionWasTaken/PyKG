@@ -176,12 +176,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: v0.0.2
-          name: v0.0.2
+          tag_name: v0.0.3
+          name: v0.0.3
           body: |
-            Verify SHA-1 hashes of PKG files. Do not extract corrupt PKGs or any subequent PKGs for that title_id.
-
-            If you are extracting files to RPCS3, this will prevent corrupt updates and help enforce the correct installation order.
+            Print the game name, title id, and app version for each pkg in the queue.
           draft: false
           prerelease: false
           files: |
