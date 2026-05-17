@@ -176,10 +176,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: v0.0.3
-          name: v0.0.3
+          tag_name: v0.0.4
+          name: v0.0.4
           body: |
-            Print the game name, title id, and app version for each pkg in the queue.
+            Add debug/homebrew PKG support.
           draft: false
           prerelease: false
           files: |
