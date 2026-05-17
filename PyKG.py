@@ -18,12 +18,14 @@ try:
 except ImportError:
     pass
 
-PKG_MAGIC    = b'\x7fPKG'
+PKG_MAGIC = b'\x7fPKG'
 PKG_TYPE_PS3 = 0x0001
+PKG_RELEASE_TYPE_DEBUG = 0x0000
+PKG_RELEASE_TYPE_RELEASE = 0x8000
 PS3_NPDRM_KEY = bytes.fromhex('2e7b71d7c9c9a14ea3221f188828b8f8')
-FLAG_DIR         = 0x04
+FLAG_DIR = 0x04
 ITEM_RECORD_SIZE = 0x20
-HDR_FMT  = '>4sHHIIIIQQQ48s16s16s'
+HDR_FMT = '>4sHHIIIIQQQ48s16s16s'
 HDR_SIZE = struct.calcsize(HDR_FMT)
 ITEM_FMT = '>IIQQII'
 MONO_FONT = 'Courier New' if sys.platform in ('win32', 'darwin') else 'Courier'
@@ -50,7 +52,21 @@ def read_header(f) -> dict:
         'data_offset': data_offset,
         'content_id': content_id,
         'iv': riv,
+        'qa_digest': digest,
+        'release_type': revision,
     }
+
+def get_debug_keystream_block(qa_digest: bytes, block_index: int) -> bytes:
+    qa_0 = qa_digest[0:8]
+    qa_1 = qa_digest[8:16]
+    buffer = bytearray(64)
+    buffer[0:8] = qa_0
+    buffer[8:16] = qa_0
+    buffer[16:24] = qa_1
+    buffer[24:32] = qa_1
+    buffer[56:64] = struct.pack(">Q", block_index)
+
+    return hashlib.sha1(buffer).digest()[:16]
 
 def make_aes_ctr(iv: bytes, stream_byte_offset: int):
     block_index = stream_byte_offset // 16
@@ -60,20 +76,37 @@ def make_aes_ctr(iv: bytes, stream_byte_offset: int):
 
     return AES.new(PS3_NPDRM_KEY, AES.MODE_CTR, counter=ctr)
 
-def decrypt_region(f, iv, data_offset, stream_pos, size):
+def decrypt_region(f, hdr: dict, stream_pos: int, size: int) -> bytes:
     if size == 0:
         return b''
 
+    data_offset = hdr['data_offset']
+    release_type = hdr['release_type']
     block_start = stream_pos & ~0xF
-    prefix_len  = stream_pos - block_start
-    cipher = make_aes_ctr(iv, block_start)
+    prefix_len = stream_pos - block_start
+    num_bytes = prefix_len + size
+    num_blocks = (num_bytes + 15) // 16
 
     f.seek(data_offset + block_start)
+    enc = f.read(num_blocks * 16)
 
-    enc = f.read(prefix_len + size)
-    plain = cipher.decrypt(enc)
-
-    return plain[prefix_len : prefix_len + size]
+    if release_type == PKG_RELEASE_TYPE_DEBUG:
+        qa_digest = hdr['qa_digest']
+        block_index = block_start // 16
+        plaintext = bytearray()
+        chunks = (enc[offset:offset + 16] for offset in range(0, len(enc), 16))
+        for i, chunk in enumerate(chunks):
+            keystream = get_debug_keystream_block(qa_digest, block_index + i)
+            plaintext.extend(a ^ b for a, b in zip(chunk, keystream))
+        return bytes(plaintext)[prefix_len : prefix_len + size]
+    else:
+        iv = hdr['iv']
+        iv_int = int.from_bytes(iv, 'big')
+        ctr_val = (iv_int + block_start // 16) & ((1 << 128) - 1)
+        ctr = Counter.new(128, initial_value=ctr_val)
+        cipher = AES.new(PS3_NPDRM_KEY, AES.MODE_CTR, counter=ctr)
+        plaintext = cipher.decrypt(enc)
+        return plaintext[prefix_len : prefix_len + size]
 
 def parse_sfo(data: bytes) -> dict | None:
     if data[:4] != b'\0PSF':
@@ -127,16 +160,16 @@ def parse_version(v: str) -> tuple:
 
     return tuple(cleaned)
 
-def find_title_id_and_version(f, items, iv, data_offset, log):
+def find_title_id_and_version(f, items, hdr, log):
     for (name_off, name_size, item_data_off, item_data_size, flags) in items:
         if name_size == 0 or item_data_size == 0:
             continue
 
-        raw_name = decrypt_region(f, iv, data_offset, name_off, name_size)
+        raw_name = decrypt_region(f, hdr, name_off, name_size)
         name = raw_name.rstrip(b'\x00').decode('utf-8', errors='replace')
 
         if name.upper().endswith('PARAM.SFO'):
-            sfo_data = decrypt_region(f, iv, data_offset, item_data_off, item_data_size)
+            sfo_data = decrypt_region(f, hdr, item_data_off, item_data_size)
             info = parse_sfo(sfo_data)
             if info:
                 tid = info.get('TITLE_ID')
@@ -204,7 +237,7 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
         log(f"CONTENT-ID: {content_id}\n")
         log(f"ITEMS: {item_count}\n")
 
-        table_raw = decrypt_region(f, iv, data_offset, 0, item_count * ITEM_RECORD_SIZE)
+        table_raw = decrypt_region(f, hdr, 0, item_count * ITEM_RECORD_SIZE)
 
         items = []
         for i in range(item_count):
@@ -212,7 +245,7 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
             name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
             items.append((name_off, name_size, item_data_off, item_data_size, flags))
 
-        title_id, app_ver, title = find_title_id_and_version(f, items, iv, data_offset, log)
+        title_id, app_ver, title = find_title_id_and_version(f, items, hdr, log)
         title_id = str(title_id)
         CHUNK = 512 * 1024
 
@@ -222,7 +255,7 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
                     progress_cb(index + 1, item_count)
                 continue
 
-            raw_name = decrypt_region(f, iv, data_offset, name_off, name_size)
+            raw_name = decrypt_region(f, hdr, name_off, name_size)
             name = raw_name.rstrip(b'\x00').decode('utf-8', errors='replace')
             is_dir = bool(flags & FLAG_DIR)
 
@@ -249,7 +282,7 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
                 with open(dest, "wb") as out:
                     while written < item_data_size:
                         chunk_size = min(CHUNK, item_data_size - written)
-                        data = decrypt_region(f, iv, data_offset, item_data_off + written, chunk_size)
+                        data = decrypt_region(f, hdr, item_data_off + written, chunk_size)
                         if not data:
                             raise IOError("Unexpected EOF while decrypting")
 
@@ -455,13 +488,13 @@ class App(ctk.CTk):
             try:
                 with open(pkg, 'rb') as f:
                     hdr = read_header(f)
-                    table_raw = decrypt_region(f, hdr['iv'], hdr['data_offset'], 0, hdr['item_count'] * ITEM_RECORD_SIZE)
+                    table_raw = decrypt_region(f, hdr, 0, hdr['item_count'] * ITEM_RECORD_SIZE)
                     items = []
                     for j in range(hdr['item_count']):
                         rec = table_raw[j * ITEM_RECORD_SIZE:(j + 1) * ITEM_RECORD_SIZE]
                         name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
                         items.append((name_off, name_size, item_data_off, item_data_size, flags))
-                    tid, version, title = find_title_id_and_version(f, items, hdr['iv'], hdr['data_offset'], lambda x: None)
+                    tid, version, title = find_title_id_and_version(f, items, hdr, lambda x: None)
                 lbl = meta_labels[i - 1]
                 text = f"{title} \n{tid} | {version}"
                 self.after(0, lambda l=lbl, t=text: l.configure(text=t))
@@ -527,7 +560,7 @@ class App(ctk.CTk):
                     iv = hdr['iv']
                     data_offset = hdr['data_offset']
 
-                    table_raw = decrypt_region(f, iv, data_offset, 0, item_count * ITEM_RECORD_SIZE)
+                    table_raw = decrypt_region(f, hdr, 0, item_count * ITEM_RECORD_SIZE)
 
                     items = []
                     for item in range(item_count):
@@ -535,12 +568,12 @@ class App(ctk.CTk):
                         name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
                         items.append((name_off, name_size, item_data_off, item_data_size, flags))
 
-                    tid, version, title = find_title_id_and_version(f, items, iv, data_offset, lambda x: None)
+                    tid, version, title = find_title_id_and_version(f, items, hdr, lambda x: None)
                     pkg_meta.append((pkg, title, tid, version, parse_version(version)))
 
             except Exception as e:
                 self.enqueue_log(f"scan failed: {pkg.name}: {e}\n")
-                pkg_meta.append((pkg, 'UNKNOWN', 'UNKNOWN', (0, 0)))
+                pkg_meta.append((pkg, 'UNKNOWN', 'UNKNOWN', '0.00', (0, 0)))
 
         groups = defaultdict(list)
 
