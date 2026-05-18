@@ -8,6 +8,7 @@ import customtkinter as ctk
 from tkinter import PhotoImage, filedialog
 from pathlib import Path
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 HAS_CRYPTO = False
 AES = None
@@ -196,7 +197,7 @@ def verify_pkg_hash(pkg_path: Path, log_cb=None) -> tuple[bool, str]:
         return False, "File too small to contain a PackageDigest"
 
     body_size = file_size - 32
-    h = hashlib.sha1()
+    h = hashlib.sha1(usedforsecurity=False)
     try:
         with open(pkg_path, 'rb') as f:
             remaining = body_size
@@ -305,13 +306,6 @@ def find_pkg_files(root: Path) -> list[Path]:
                 continue
             pkgs.append(p)
     return sorted(pkgs)
-
-def peek_content_id(pkg_path: Path) -> str:
-    try:
-        with open(pkg_path, 'rb') as f:
-            return read_header(f)['content_id']
-    except Exception as exc:
-        return f"(error: {exc})"
 
 def resource_path(relative_path):
     base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
@@ -453,6 +447,7 @@ class App(ctk.CTk):
         self.clear_list()
         self._pkg_files = []
         self._pkg_hash_ok = {}
+        self._pkg_meta = {} 
         self.extract_btn.configure(state='disabled')
         self.progress.set(0)
 
@@ -468,8 +463,7 @@ class App(ctk.CTk):
         hash_labels = []
         meta_labels = []
         for pkg in pkgs:
-            cid = peek_content_id(pkg)
-            hash_label, meta_label = self.add_list_item(pkg, cid)
+            hash_label, meta_label = self.add_list_item(pkg)
             hash_labels.append(hash_label)
             meta_labels.append(meta_label)
 
@@ -478,13 +472,20 @@ class App(ctk.CTk):
 
     def scan_worker(self, pkgs: list[Path], hash_labels: list, meta_labels: list):
         total = len(pkgs)
-        for i, (pkg, hash_label) in enumerate(zip(pkgs, hash_labels), 1):
-            ok, msg = verify_pkg_hash(pkg)
-            self._pkg_hash_ok[pkg] = ok
-            color = 'green' if ok else 'red'
-            self.after(0, lambda lbl=hash_label, m=msg, c=color: lbl.configure(text=m, text_color=c))
-            self.after(0, self.progress.set, i / total)
 
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(verify_pkg_hash, pkg): (i, pkg, hash_label)
+                    for i, (pkg, hash_label) in enumerate(zip(pkgs, hash_labels), 1)}
+
+            for future in as_completed(futures):
+                i, pkg, hash_label = futures[future]
+                ok, msg = future.result()
+                self._pkg_hash_ok[pkg] = ok
+                color = 'green' if ok else 'red'
+                self.after(0, lambda lbl=hash_label, m=msg, c=color: lbl.configure(text=m, text_color=c))
+                self.after(0, self.progress.set, i / total)
+        
+        for i, (pkg, meta_label) in enumerate(zip(pkgs, meta_labels), 1):
             try:
                 with open(pkg, 'rb') as f:
                     hdr = read_header(f)
@@ -495,13 +496,11 @@ class App(ctk.CTk):
                         name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
                         items.append((name_off, name_size, item_data_off, item_data_size, flags))
                     tid, version, title = find_title_id_and_version(f, items, hdr, lambda x: None)
-                lbl = meta_labels[i - 1]
-                text = f"{title} \n{tid} | {version}"
-                self.after(0, lambda l=lbl, t=text: l.configure(text=t))
+                    self._pkg_meta[pkg] = (title or 'UNKNOWN', tid or 'UNKNOWN', version or '0.00', parse_version(version or '0.00'))
+                text = f"{title or 'UNKNOWN'}\n{tid or 'UNKNOWN'} | {version or '0.00'}"
+                self.after(0, lambda l=meta_label, t=text: l.configure(text=t))
             except Exception:
-                pass
-
-        self._meta_labels: dict[Path, ctk.CTkLabel] = dict(zip(pkgs, meta_labels))
+                self._pkg_meta[pkg] = ('UNKNOWN', 'UNKNOWN', '0.00', (0, 0))
 
         self.set_status(f"{total} PKG(s) ready.")
         self.after(0, self.progress.set, 0)
@@ -536,44 +535,20 @@ class App(ctk.CTk):
         self.enqueue_log("\nCancelling after current file…\n")
 
     def worker_fn(self, pkgs: list[Path], dest: Path):
-        total = len(pkgs)
         ok = 0
         fail = 0
-
-        self.enqueue_log("\nScanning PKGs for version info...\n")
-
         pkg_meta = []
         ordered_pkgs = []
         skipped_title_ids: set[str] = set()
 
-        for i, pkg in enumerate(pkgs, 1):
-            if self.cancel_flag.is_set():
-                self.enqueue_log("Cancelled during scan.\n")
-                return
+        self.enqueue_log("\nScanning PKGs for version info...\n")
 
-            self.enqueue_log(f"  [{i}/{total}] scanning {pkg.name}\n")
-
-            try:
-                with open(pkg, 'rb') as f:
-                    hdr = read_header(f)
-                    item_count = hdr['item_count']
-                    iv = hdr['iv']
-                    data_offset = hdr['data_offset']
-
-                    table_raw = decrypt_region(f, hdr, 0, item_count * ITEM_RECORD_SIZE)
-
-                    items = []
-                    for item in range(item_count):
-                        rec = table_raw[item * ITEM_RECORD_SIZE:(item + 1) * ITEM_RECORD_SIZE]
-                        name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
-                        items.append((name_off, name_size, item_data_off, item_data_size, flags))
-
-                    tid, version, title = find_title_id_and_version(f, items, hdr, lambda x: None)
-                    pkg_meta.append((pkg, title, tid, version, parse_version(version)))
-
-            except Exception as e:
-                self.enqueue_log(f"scan failed: {pkg.name}: {e}\n")
-                pkg_meta.append((pkg, 'UNKNOWN', 'UNKNOWN', '0.00', (0, 0)))
+        for pkg in pkgs:
+            if pkg in self._pkg_meta:
+                title, tid, version, ver = self._pkg_meta[pkg]
+            else:
+                title, tid, version, ver = 'UNKNOWN', 'UNKNOWN', '0.00', (0, 0)
+            pkg_meta.append((pkg, title, tid, version, ver))
 
         groups = defaultdict(list)
 
@@ -591,6 +566,7 @@ class App(ctk.CTk):
 
         self.enqueue_log("\nExtraction order finalized.\n")
 
+        pkg_to_tid: dict[Path, str] = {p: tid for p, title, tid, version, _ in pkg_meta}
         for count, pkg in enumerate(ordered_pkgs, 1):
             if self.cancel_flag.is_set():
                 self.enqueue_log(f"\nCancelled after {count-1}/{len(ordered_pkgs)} PKGs.\n")
@@ -598,14 +574,10 @@ class App(ctk.CTk):
 
             if not self._pkg_hash_ok.get(pkg, False):
                 self.enqueue_log(f"\n[{count}/{len(ordered_pkgs)}] SKIPPED (hash mismatch): {pkg.name}\n")
-                for p, title, tid, version, _ in pkg_meta:
-                    if p == pkg:
-                        skipped_title_ids.add(tid)
-                        break
+                skipped_title_ids.add(pkg_to_tid[pkg])
                 self.after(0, self.progress.set, count / len(ordered_pkgs))
                 continue
 
-            pkg_to_tid: dict[Path, str] = {p: tid for p, title, tid, version, _ in pkg_meta}
             pkg_tid = pkg_to_tid.get(pkg)
             if pkg_tid in skipped_title_ids:
                 self.enqueue_log(f"\n[{count}/{len(ordered_pkgs)}] SKIPPED (title ID {pkg_tid} has failed PKG): {pkg.name}\n")
@@ -645,10 +617,10 @@ class App(ctk.CTk):
         for w in self.list_frame.winfo_children():
             w.destroy()
 
-    def add_list_item(self, p: Path, cid: str):
+    def add_list_item(self, p: Path):
         fr = ctk.CTkFrame(self.list_frame, fg_color=('gray83', 'gray22'), corner_radius=4)
         fr.pack(fill='x', pady=2, padx=2)
-        meta_label = ctk.CTkLabel(fr, text="", font=ctk.CTkFont(size=11),
+        meta_label = ctk.CTkLabel(fr, text="Scanning PKG Data...", font=ctk.CTkFont(size=11),
                     anchor='w', justify='left')
         meta_label.pack(fill='x', padx=8, pady=(4,0))
         ctk.CTkLabel(fr, text=p.name, font=ctk.CTkFont(size=10),
