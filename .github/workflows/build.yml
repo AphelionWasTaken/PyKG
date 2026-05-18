@@ -176,10 +176,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: v0.0.4
-          name: v0.0.4
+          tag_name: v0.0.5
+          name: v0.0.5
           body: |
-            Add debug/homebrew PKG support.
+            Speed up hash checking and metadata population.
+
+            Clean up some redundant code.
           draft: false
           prerelease: false
           files: |
