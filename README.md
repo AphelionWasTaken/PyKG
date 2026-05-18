@@ -5,9 +5,11 @@ You can use this tool to explore PKG contents, or you can use it to bulk install
 
 Features:
 - Windows, Linux, and MacOS support
+- Retail and debug/homebrew PKG support
 - A clean and easy to use GUI
 - PARAM.SFO verification of PKG info
 - Recursive folder scanning
+- Hash verification of PKG files
 <p align="center">
   <img width="576" height="457" alt="image" src="https://github.com/user-attachments/assets/eb92ae51-b2d9-4eb6-bd6e-4a0cff8f2a7f" />
 </p>
