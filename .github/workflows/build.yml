@@ -176,12 +176,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: v0.0.5
-          name: v0.0.5
+          tag_name: v0.0.6
+          name: v0.0.6
           body: |
-            Speed up hash checking and metadata population.
-
-            Clean up some redundant code.
+            Add support for multi-path PKGs made with PKG Custom/pypkg.
           draft: false
           prerelease: false
           files: |

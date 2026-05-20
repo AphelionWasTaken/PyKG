@@ -228,11 +228,8 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
             log_cb(msg)
 
     with open(pkg_path, 'rb') as f:
-        f.seek(0)
         hdr = read_header(f)
         item_count = hdr['item_count']
-        data_offset = hdr['data_offset']
-        iv = hdr['iv']
         content_id = hdr['content_id']
 
         log(f"CONTENT-ID: {content_id}\n")
@@ -242,42 +239,56 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
 
         items = []
         for i in range(item_count):
-            rec = table_raw[i * ITEM_RECORD_SIZE : (i + 1) * ITEM_RECORD_SIZE]
+            rec = table_raw[i * ITEM_RECORD_SIZE: (i + 1) * ITEM_RECORD_SIZE]
             name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
             items.append((name_off, name_size, item_data_off, item_data_size, flags))
 
         title_id, app_ver, title = find_title_id_and_version(f, items, hdr, log)
         title_id = str(title_id)
+
+        raw_names = []
+        for (name_off, name_size, _, _, _) in items:
+            if name_size > 0:
+                raw = decrypt_region(f, hdr, name_off, name_size)
+                raw_names.append(raw.rstrip(b'\x00').decode('utf-8', errors='replace'))
+            else:
+                raw_names.append('')
+
+        path_pkg = is_path_pkg(raw_names)
+        if path_pkg:
+            log("Detected pypkg path-traversal PKG — using virtual PS3 root extraction.\n")
+
         CHUNK = 512 * 1024
 
-        for index, (name_off, name_size, item_data_off, item_data_size, flags) in enumerate(items):
+        for index, ((name_off, name_size, item_data_off, item_data_size, flags), name) in enumerate(zip(items, raw_names)):
             if name_size == 0:
                 if progress_cb:
                     progress_cb(index + 1, item_count)
                 continue
 
-            raw_name = decrypt_region(f, hdr, name_off, name_size)
-            name = raw_name.rstrip(b'\x00').decode('utf-8', errors='replace')
             is_dir = bool(flags & FLAG_DIR)
 
             if not name or name in ('.', '..'):
                 continue
 
-            name = name.replace('\\', '/').strip('/')
-            if '\x00' in name:
-                continue
-
-            dest = dest_root / title_id / name
+            if path_pkg:
+                dest = resolve_path_pkg_dest(name, dest_root)
+                if dest is None:
+                    log(f"SKIPPED (unsafe path): {name}\n")
+                    continue
+            else:
+                name = name.replace('\\', '/').strip('/')
+                if not name or '\x00' in name:
+                    continue
+                dest = dest_root / title_id / name
 
             if is_dir:
                 if dest.exists() and dest.is_file():
                     dest.unlink()
-
                 dest.mkdir(parents=True, exist_ok=True)
             else:
                 if dest.parent.exists() and dest.parent.is_file():
                     dest.parent.unlink()
-
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 written = 0
                 with open(dest, "wb") as out:
@@ -286,7 +297,6 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
                         data = decrypt_region(f, hdr, item_data_off + written, chunk_size)
                         if not data:
                             raise IOError("Unexpected EOF while decrypting")
-
                         out.write(data)
                         written += len(data)
                 size_kb = item_data_size / 1024
@@ -310,6 +320,36 @@ def find_pkg_files(root: Path) -> list[Path]:
 def resource_path(relative_path):
     base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
+
+def is_path_pkg(items_names: list[str]) -> bool:
+    for name in items_names:
+        if name.startswith('../') or name.startswith('..\\'):
+            return True
+    return False
+
+def resolve_path_pkg_dest(raw_name: str, dest_root: Path) -> Path | None:
+    name = raw_name.replace('\\', '/')
+    parts = [p for p in name.split('/') if p]
+    resolved = []
+
+    for part in parts:
+        if part == '..':
+            if resolved:
+                resolved.pop()
+        elif part != '.':
+            resolved.append(part)
+
+    if not resolved:
+        return None
+
+    result = dest_root.joinpath(*resolved)
+
+    try:
+        result.resolve().relative_to(dest_root.resolve())
+    except ValueError:
+        return None
+
+    return result
 
 class App(ctk.CTk):
     def __init__(self):
