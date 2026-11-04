@@ -176,10 +176,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: v0.0.6
-          name: v0.0.6
+          tag_name: v0.1.0
+          name: v0.1.0
           body: |
-            Add support for multi-path PKGs made with PKG Custom/pypkg.
+            Add support for creating/repacking pkgs.
           draft: false
           prerelease: false
           files: |
