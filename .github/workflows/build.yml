@@ -176,10 +176,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: v0.1.0
-          name: v0.1.0
+          tag_name: v0.1.1
+          name: v0.1.1
           body: |
-            Add support for creating/repacking pkgs.
+            Grid all widgets instead of a mix of grid and pack.
           draft: false
           prerelease: false
           files: |
