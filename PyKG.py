@@ -699,7 +699,7 @@ class CTkMultiSelectDropdown(ctk.CTkFrame):
                 variable=var,
                 command=lambda v=value: self.update_selection(v)
             )
-            checkbox.pack(anchor='w', padx=10, pady=5)
+            checkbox.grid(sticky='w', padx=10, pady=5)
 
         self.dropdown.update_idletasks()
 
@@ -1087,6 +1087,7 @@ class App(ctk.CTk):
 
         self.list_frame = ctk.CTkScrollableFrame(mp)
         self.list_frame.grid(row=1, column=0, sticky='nsew', padx=(0, 8))
+        self.list_frame.grid_columnconfigure(0, weight=1)
 
         self.log_box = ctk.CTkTextbox(mp, font=ctk.CTkFont(family=MONO_FONT, size=11),
             activate_scrollbars=True, state='disabled')
@@ -1348,19 +1349,19 @@ class App(ctk.CTk):
 
     def add_list_item(self, p: Path):
         fr = ctk.CTkFrame(self.list_frame, fg_color=('gray83', 'gray22'), corner_radius=4)
-        fr.pack(fill='x', pady=2, padx=2)
+        fr.grid(sticky='ew', pady=2, padx=2)
         meta_label = ctk.CTkLabel(fr, text="Scanning PKG Data...", font=ctk.CTkFont(size=11),
                     anchor='w', justify='left')
-        meta_label.pack(fill='x', padx=8, pady=(4,0))
+        meta_label.grid(sticky='ew', padx=8, pady=(4,0))
         ctk.CTkLabel(fr, text=p.name, font=ctk.CTkFont(size=10),
-                    anchor='w').pack(fill='x', padx=8, pady=(4, 0))
+                    anchor='w').grid(sticky='ew', padx=8, pady=(4, 0))
         hash_label = ctk.CTkLabel(fr, text="Verifying Hash...",
                     font=ctk.CTkFont(size=10), text_color="#ced900",
                     anchor='w', justify='left')
-        hash_label.pack(fill='x', padx=8)
+        hash_label.grid(sticky='ew', padx=8)
         ctk.CTkLabel(fr, text=str(p.parent),
                     font=ctk.CTkFont(size=10), text_color='#666',
-                    anchor='w', wraplength=270, justify='left').pack(fill='x', padx=8, pady=(0, 4))
+                    anchor='w', wraplength=270, justify='left').grid(sticky='ew', padx=8, pady=(0, 4))
 
         
         return hash_label, meta_label
