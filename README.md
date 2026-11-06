@@ -43,7 +43,7 @@ Next, either select an existing pkg to copy the header data, flags, and PARAM.SF
 
 If you selected "Custom PKG", you must input the content ID and select a PKG type.
 
-If you do not have a PARAM.SFO for your PKG and you are not using an existing PKG as a template, you must check the "Create PARAM.SFO" and fill out the PARAM.SFO fields. If you do not fill out a field, default values will be used.
+If you are making a PKG type that requires a PARAM.SFO and you do not have one and you are not using an existing PKG as a template, you must check the "Create PARAM.SFO" and fill out the PARAM.SFO fields. If you do not fill out a field, default values will be used.
 
 Select the output folder for the PKG file and hit "Repackage" to being creating the PKG.
 
