@@ -746,8 +746,21 @@ class CTkMultiSelectDropdown(ctk.CTkFrame):
 
 class RepackDialog(ctk.CTkToplevel):
     TYPES = {
+        "Game Data / Patch / DLC (GameData)": (4, 0x8),
         "Game / Homebrew App (GameExec)": (5, 0xE),
-        "Game Data / DLC (GameData)": (4, 0x8),
+        "PS1 Classic (PS1Emu)": (6, 0x8),
+        "PC Engine": (7, 0x8),
+        "Theme": (9, 0x88),
+        "Widget": (10, 0x88),
+        "License": (11, 0x8),
+        "VSH Module": (12, 0x8),
+        "PSN Avatar": (13, 0x8),
+        "PSP Go": (14, 0x8),
+        "PSP Mini": (15, 0x8),
+        "NeoGeo": (16, 0x8),
+        "Virtual Memory Card (VMC)": (17, 0x8),
+        "PS2 Classic": (18, 0x8),
+        "PSP Remastered": (20, 0x8),
     }
 
     CATEGORIES = {
