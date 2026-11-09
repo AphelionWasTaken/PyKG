@@ -39,6 +39,7 @@ TYPE_NPDRM_SELF = 0x01
 TYPE_RAW = 0x03
 CRYPT_CHUNK = 512 * 1024
 CONTENT_ID_RE = re.compile(r'^[A-Z0-9]{6}-[A-Z0-9]{9}_[0-9]{2}-[A-Z0-9_]{16}$')
+SAFE_FOLDER_RE = re.compile(r'[A-Za-z0-9_-]{1,32}')
 
 @dataclass
 class PkgSettings:
@@ -77,6 +78,8 @@ def read_header(f) -> dict:
         'iv': riv,
         'qa_digest': digest,
         'release_type': revision,
+        'meta_offset': meta_offset,
+        'meta_count': meta_count,
     }
 
 def get_debug_keystream_block(qa_digest: bytes, block_index: int) -> bytes:
@@ -244,6 +247,30 @@ def verify_pkg_hash(pkg_path: Path, log_cb=None) -> tuple[bool, str]:
                        f"stored: {stored_hash.hex()}\n"
                        f"computed: {computed_hash.hex()}")
 
+def title_id_from_content_id(content_id: str) -> str | None:
+    m = re.match(r'^[A-Z0-9]{6}-([A-Z0-9]{9})_', content_id)
+    return m.group(1) if m else None
+
+def read_install_folder(f, hdr: dict) -> str | None:
+    f.seek(hdr['meta_offset'])
+    for _ in range(hdr['meta_count']):
+        head = f.read(8)
+        if len(head) < 8:
+            break
+        pid, psz = struct.unpack('>II', head)
+        data = f.read(psz)
+        if pid == 0x0A and psz > 8:
+            return data[8:].rstrip(b'\0').decode('ascii', 'replace') or None
+    return None
+
+def resolve_folder_name(f, hdr: dict, sfo_title_id: str | None) -> str | None:
+    for candidate in (read_install_folder(f, hdr),
+                      title_id_from_content_id(hdr['content_id']),
+                      sfo_title_id):
+        if candidate and SAFE_FOLDER_RE.fullmatch(candidate):
+            return candidate
+    return None
+
 def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) -> str:
     def log(msg: str):
         if log_cb:
@@ -265,8 +292,9 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
             name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
             items.append((name_off, name_size, item_data_off, item_data_size, flags))
 
-        title_id, app_ver, title = find_title_id_and_version(f, items, hdr, log)
-        title_id = str(title_id)
+        sfo_title_id, app_ver, title = find_title_id_and_version(f, items, hdr, log)
+
+        title_id = resolve_folder_name(f, hdr, sfo_title_id)
 
         raw_names = []
         for (name_off, name_size, _, _, _) in items:
@@ -279,6 +307,11 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
         path_pkg = is_path_pkg(raw_names)
         if path_pkg:
             log("Detected pypkg path-traversal PKG — using virtual PS3 root extraction.\n")
+
+        if not title_id and not path_pkg:
+            raise ValueError("Could not determine a folder name: bad Content ID and no TITLE_ID in PARAM.SFO.\n"
+                            "If this is a DLC PKG, the install-folder metadata was not found.")
+        title_id = title_id or ''
 
         CHUNK = 512 * 1024
 
@@ -449,7 +482,7 @@ def _pack_hdr(revision, pkg_type, tpl, n_items, total, data_size, content_id_raw
                        content_id_raw, digest, riv)
 
 def repack_pkg(src_dir: Path, template_pkg: Path | None, out_pkg: Path, settings: PkgSettings | None = None,
-               progress_cb=None, log_cb=None, cancel_flag=None) -> None:
+               progress_cb=None, log_cb=None, cancel_flag=None, content_id: str | None = None) -> None:
     def log(msg):
         if log_cb:
             log_cb(msg)
@@ -462,6 +495,24 @@ def repack_pkg(src_dir: Path, template_pkg: Path | None, out_pkg: Path, settings
         tpl = scratch_template(settings)
     else:
         raise ValueError("Give either a template PKG or PkgSettings.")
+
+    if template_pkg is not None and content_id:
+        if not CONTENT_ID_RE.match(content_id):
+            raise ValueError("Content ID must be in the format: 'UP0001-BLUS12345_00-MYHOMEBREW000000' "
+                             "(6 chars - 9 chars _ 2 digits - 16 chars)")
+        new_raw = content_id.encode('ascii').ljust(0x30, b'\0')
+        if new_raw != tpl['content_id_raw']:
+            old_cid = tpl['content_id_raw'].rstrip(b'\0').decode('ascii', 'replace')
+            log(f"Content ID changed: {old_cid} -> {content_id}\n")
+            if tpl['revision'] != PKG_RELEASE_TYPE_DEBUG:
+                log("WARNING: Content ID modified. The template is a retail (finalized) PKG. "
+                    "Its license and NPDRM content are tied to the original Content ID, "
+                    "so the repacked PKG may not install or run correctly.\n")
+            if title_id_from_content_id(old_cid) != title_id_from_content_id(content_id):
+                log("NOTE: Title ID part changed, but the template's metadata packets "
+                    "still contain the original title ID.\n")
+            tpl['content_id_raw'] = new_raw
+
     scratch = tpl['scratch']
     revision = tpl['revision']
     debug = revision == PKG_RELEASE_TYPE_DEBUG
@@ -863,7 +914,7 @@ class RepackDialog(ctk.CTkToplevel):
         
         row(4, "Content ID:", 'cid', None, "UP0001-BLUS30001_00-MYHOMEBREW000000")
         
-        ctk.CTkCheckBox(self, text="Create Param.SFO?", variable=self.param_var, command=toggle_widget).grid(row=6, column=1, sticky='w', pady=6)
+        ctk.CTkCheckBox(self, text="Create PARAM.SFO?", variable=self.param_var, command=toggle_widget).grid(row=6, column=1, sticky='w', pady=6)
         
         ctk.CTkLabel(self, text="Type:", anchor='e', width=110).grid(row=5, column=0, padx=(12, 8), pady=6)
         ctk.CTkOptionMenu(self, variable=self.type_var, values=list(self.TYPES)).grid(
@@ -929,10 +980,16 @@ class RepackDialog(ctk.CTkToplevel):
 
     def pick_tpl(self):
         p = filedialog.askopenfilename(title="Original PKG", filetypes=[('PS3 PKG', '*.pkg')])
-        if p:
-            self.entries['tpl'].delete(0, 'end')
-            self.entries['tpl'].insert(0, p)
-            self.mode_var.set('template')
+        if not p:
+            return
+        self.set_entry('tpl', p)
+        self.mode_var.set('template')
+        try:
+            with open(p, 'rb') as f:
+                hdr = read_header(f)
+            self.set_entry('cid', hdr['content_id'])
+        except Exception as e:
+            self.app.enqueue_log(f"Could not read Content ID from template: {e}\n")
 
     def pick_out(self):
         p = filedialog.asksaveasfilename(title="Save PKG As", defaultextension='.pkg', filetypes=[('PS3 PKG', '*.pkg')])
@@ -994,10 +1051,16 @@ class RepackDialog(ctk.CTkToplevel):
             if Path(tpl).resolve() == Path(out).resolve():
                 log("Output can't overwrite the template.\n")
                 return
+            content_id = self.get('cid').upper() or None
+            if content_id and not CONTENT_ID_RE.match(content_id):
+                log("Content ID must look like 'UP0001-BLUS30001_00-MYUPDATE00000000' "
+                    "(6 chars - 9 chars _ 2 digits - 16 chars)\n")
+                return
             tpl, settings = Path(tpl), None
         else:
             ctype, flags = self.TYPES[self.type_var.get()]
             tpl = None
+            content_id = None
             settings = PkgSettings(content_id=self.get('cid').upper(),
                                 content_type=ctype, package_flags=flags)
 
@@ -1017,7 +1080,7 @@ class RepackDialog(ctk.CTkToplevel):
                 "SOUND_FORMAT": self.flags('sound'),
             }, Path(src))
 
-        self.app.start_repack(Path(src), tpl, settings, Path(out))
+        self.app.start_repack(Path(src), tpl, settings, Path(out), content_id)
         self.destroy()
 
 class App(ctk.CTk):
@@ -1116,19 +1179,19 @@ class App(ctk.CTk):
             return
         RepackDialog(self)
 
-    def start_repack(self, src, tpl, settings, out):
+    def start_repack(self, src, tpl, settings, out, content_id=None):
         self.cancel_flag.clear()
         self.repack_btn.configure(state='disabled')
         self.cancel_btn.configure(state='normal')
         self.progress.set(0)
         threading.Thread(target=self.repack_worker, args=(src, tpl, settings, out), daemon=True).start()
 
-    def repack_worker(self, src, tpl, settings, out):
+    def repack_worker(self, src, tpl, settings, out, content_id=None):
         try:
             self.enqueue_log(f"\nRepackaging {src} -> {out}\n")
             repack_pkg(src, tpl, out, settings=settings,
                     progress_cb=lambda d, t: self.after(0, self.progress.set, d / t),
-                    log_cb=self.enqueue_log, cancel_flag=self.cancel_flag)
+                    log_cb=self.enqueue_log, cancel_flag=self.cancel_flag,)
             ok, msg = verify_pkg_hash(out)
             self.enqueue_log(f"\nDone. Verify: {msg}\n")
             self.set_status("Repack complete." if ok else "Repack finished with a hash problem.")
@@ -1238,7 +1301,8 @@ class App(ctk.CTk):
                         rec = table_raw[j * ITEM_RECORD_SIZE:(j + 1) * ITEM_RECORD_SIZE]
                         name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
                         items.append((name_off, name_size, item_data_off, item_data_size, flags))
-                    tid, version, title = find_title_id_and_version(f, items, hdr, lambda x: None)
+                    sfo_tid, version, title = find_title_id_and_version(f, items, hdr, lambda x: None)
+                    tid = resolve_folder_name(f, hdr, sfo_tid)
                     self._pkg_meta[pkg] = (title or 'UNKNOWN', tid or 'UNKNOWN', version or '0.00', parse_version(version or '0.00'))
                 text = f"{title or 'UNKNOWN'}\n{tid or 'UNKNOWN'} | {version or '0.00'}"
                 self.after(0, lambda l=meta_label, t=text: l.configure(text=t))
