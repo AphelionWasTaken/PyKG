@@ -409,17 +409,21 @@ def read_template(tpl_path: Path) -> dict:
 
         table = decrypt_region(f, hdr, 0, item_count * ITEM_RECORD_SIZE)
         order, flags_by_name = [], {}
+        template_sfo = None
         for i in range(item_count):
             rec = table[i * ITEM_RECORD_SIZE:(i + 1) * ITEM_RECORD_SIZE]
-            n_off, n_size, _, _, flags, _ = struct.unpack(ITEM_FMT, rec)
+            n_off, n_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
             name = decrypt_region(f, hdr, n_off, n_size).rstrip(b'\0').decode('utf-8', 'replace')
             order.append(name)
             flags_by_name[name] = flags
 
+            if name.upper() == "PARAM.SFO":
+                template_sfo = decrypt_region(f, hdr, item_data_off, item_data_size)
+
     return dict(scratch=False, revision=revision, pkg_type=pkg_type, meta_off=meta_off,
                 meta_cnt=meta_cnt, meta_size=meta_size, total_size=total_size,
                 data_off=data_off, data_size=data_size, content_id_raw=content_id_raw,
-                digest=digest, riv=riv, meta_blob=meta_blob, order=order, flags=flags_by_name)
+                digest=digest, riv=riv, meta_blob=meta_blob, order=order, flags=flags_by_name, sfo_data=template_sfo)
 
 def scratch_template(s: PkgSettings) -> dict:
     if not CONTENT_ID_RE.match(s.content_id):
@@ -467,11 +471,15 @@ def _walk_sorted(root: Path, prefix: str = '') -> list[tuple[str, Path, bool]]:
             out.extend(_walk_sorted(Path(entry.path), prefix + entry.name + '/'))
     return out
 
-def collect_repack_items(src_dir: Path, tpl_order: list[str]) -> list[tuple[str, Path, bool]]:
+def collect_repack_items(src_dir: Path, tpl_order: list[str], generated_sfo: bytes | None = None) -> list[tuple[str, Path | None, bool]]:
     walked = _walk_sorted(src_dir)
+    if generated_sfo is not None:
+        walked = [item for item in walked if item[0] != "PARAM.SFO"]
+        walked.append(("PARAM.SFO", None, False))
+
     if not tpl_order:
         return walked
-    by_name = {name: (name, path, dir) for name, path, dir in walked}
+    by_name = {name: (name, path, is_dir) for name, path, is_dir in walked}
     ordered = [by_name[name] for name in tpl_order if name in by_name]
     seen = {name for name, _, _ in ordered}
     return ordered + [item for item in walked if item[0] not in seen]
@@ -482,7 +490,8 @@ def _pack_hdr(revision, pkg_type, tpl, n_items, total, data_size, content_id_raw
                        content_id_raw, digest, riv)
 
 def repack_pkg(src_dir: Path, template_pkg: Path | None, out_pkg: Path, settings: PkgSettings | None = None,
-               progress_cb=None, log_cb=None, cancel_flag=None, content_id: str | None = None) -> None:
+               progress_cb=None, log_cb=None, cancel_flag=None, content_id: str | None = None,
+               generated_sfo: bytes | None = None) -> None:
     def log(msg):
         if log_cb:
             log_cb(msg)
@@ -517,7 +526,7 @@ def repack_pkg(src_dir: Path, template_pkg: Path | None, out_pkg: Path, settings
     revision = tpl['revision']
     debug = revision == PKG_RELEASE_TYPE_DEBUG
 
-    items = collect_repack_items(src_dir, tpl['order'])
+    items = collect_repack_items(src_dir, tpl['order'], generated_sfo)
     if not items:
         raise ValueError("Source folder is empty.")
     present = {name for name, _, _ in items}
@@ -537,7 +546,7 @@ def repack_pkg(src_dir: Path, template_pkg: Path | None, out_pkg: Path, settings
         default = TYPE_OVERWRITE | (FLAG_DIR if is_dir else TYPE_RAW)
         old = tpl['flags'].get(name)
         flags = old if old is not None and ((old & 0xFF) == FLAG_DIR) == is_dir else default
-        size = 0 if is_dir else path.stat().st_size
+        size = 0 if is_dir else (len(generated_sfo) if path is None else path.stat().st_size)
         records.append(struct.pack(ITEM_FMT, n_off, len(nr), pos, size, flags, 0))
         sizes.append(size)
         if not is_dir:
@@ -559,6 +568,11 @@ def repack_pkg(src_dir: Path, template_pkg: Path | None, out_pkg: Path, settings
         for (name, path, is_dir), size in zip(items, sizes):
             if is_dir:
                 continue
+            if path is None:
+                qa.update(generated_sfo)
+                tick(len(generated_sfo))
+                continue
+
             with open(path, 'rb') as src:
                 while True:
                     if cancel_flag is not None and cancel_flag.is_set():
@@ -628,6 +642,11 @@ def repack_pkg(src_dir: Path, template_pkg: Path | None, out_pkg: Path, settings
                 if cancel_flag is not None and cancel_flag.is_set():
                     raise InterruptedError("Cancelled")
                 log(f"PACKING FILE: {name} ({size / 1024:,.1f} KB)\n")
+                if path is None:
+                    emit_plain(generated_sfo)
+                    tick(len(generated_sfo))
+                    continue
+
                 written = 0
                 with open(path, 'rb') as src:
                     while written < size:
@@ -997,38 +1016,80 @@ class RepackDialog(ctk.CTkToplevel):
             self.entries['out'].delete(0, 'end')
             self.entries['out'].insert(0, p)
 
-    def create_sfo(self, parameters, src_dir):
-        key_table = bytearray()
-        data_table = bytearray()
-        index = []
+    def create_sfo(self, parameters, src_dir, template_sfo=None):
+        if template_sfo is not None:
+            sfo_data = bytearray(template_sfo)
+            magic, version, key_table_off, data_table_off, entry_count = struct.unpack_from('<4sIIII', sfo_data, 0)
+            if magic != b'\0PSF':
+                raise ValueError("Invalid template PARAM.SFO")
 
-        for key, value in sorted(parameters.items()):
-            key_off = len(key_table)
-            key_table += key.encode('ascii') + b'\0'
+            for i in range(entry_count):
+                entry_pos = 20 + i * 16
+                key_off, fmt, data_len, data_max, data_off = struct.unpack_from('<HHIII', sfo_data, entry_pos)
+                key_start = key_table_off + key_off
+                key_end = sfo_data.index(0, key_start)
+                key = sfo_data[key_start:key_end].decode('ascii')
+                if key not in parameters:
+                    continue
 
-            if isinstance(value, int):
-                fmt, used, max_len = 0x0404, 4, 4
-                data = struct.pack('<I', value)
-            else:
-                max_len = self.SFO_MAX.get(key, 0x40)
-                raw = str(value).encode('utf-8')[:max_len - 1]
-                used = len(raw) + 1
-                fmt = 0x0204
-                data = raw + b'\0' * (max_len - len(raw))
+                value = parameters[key]
+                if fmt == 0x0404:
+                    data = struct.pack('<I', int(value))
+                elif fmt == 0x0204:
+                    raw = str(value).encode('utf-8')
+                    if len(raw) + 1 > data_max:
+                        raise ValueError(f"'{key}' is too long for the template SFO "
+                            f"({len(raw) + 1} bytes needed, {data_max} available)")
+                    data = raw + b'\0'
+                else:
+                    continue
 
-            index.append((key_off, fmt, used, max_len, len(data_table)))
-            data_table += data
+                if len(data) > data_max:
+                    raise ValueError(f"Value for '{key}' exceeds its allocated size")
 
-        key_table_off = 20 + 16 * len(index)
-        padding = (-(key_table_off + len(key_table))) % 4
-        data_table_off = key_table_off + len(key_table) + padding
+                data_start = data_table_off + data_off
+                data_end = data_start + data_max
+                sfo_data[data_start:data_end] = data.ljust(data_max, b'\0')
+                struct.pack_into('<I', sfo_data, entry_pos + 4, len(data))
 
-        header = struct.pack('<4sIIII', b'\0PSF', 0x00000101,
-                            key_table_off, data_table_off, len(index))
-        index_blob = b"".join(struct.pack('<HHIII', *e) for e in index)
+            sfo_data = bytes(sfo_data)
 
-        with open(Path(src_dir) / "PARAM.SFO", 'wb') as f:
-            f.write(header + index_blob + key_table + b'\0' * padding + data_table)
+        else:
+            key_table = bytearray()
+            data_table = bytearray()
+            index = []
+
+            for key, value in sorted(parameters.items()):
+                key_off = len(key_table)
+                key_table += key.encode('ascii') + b'\0'
+
+                if isinstance(value, int):
+                    fmt, used, max_len = 0x0404, 4, 4
+                    data = struct.pack('<I', value)
+                else:
+                    max_len = self.SFO_MAX.get(key, 0x40)
+                    raw = str(value).encode('utf-8')[:max_len - 1]
+                    used = len(raw) + 1
+                    fmt = 0x0204
+                    data = raw + b'\0' * (max_len - len(raw))
+
+                index.append((key_off, fmt, used, max_len, len(data_table)))
+                data_table += data
+
+            key_table_off = 20 + 16 * len(index)
+            padding = (-(key_table_off + len(key_table))) % 4
+            data_table_off = key_table_off + len(key_table) + padding
+
+            header = struct.pack('<4sIIII', b'\0PSF', 0x00000101,
+                                key_table_off, data_table_off, len(index))
+            index_blob = b"".join(struct.pack('<HHIII', *e) for e in index)
+            sfo_data = header + index_blob + key_table + b'\0' * padding + data_table
+
+        if src_dir is not None:
+            with open(Path(src_dir) / "PARAM.SFO", 'wb') as f:
+                f.write(sfo_data)
+
+        return sfo_data
 
     def to_int(self, key):
         try:
@@ -1064,8 +1125,10 @@ class RepackDialog(ctk.CTkToplevel):
             settings = PkgSettings(content_id=self.get('cid').upper(),
                                 content_type=ctype, package_flags=flags)
 
+        generated_sfo = None
+        sfo_parameters = {}
         if self.param_var.get():
-            self.create_sfo({
+            sfo_parameters = {
                 "TITLE": self.get('title') or "My PKG",
                 "TITLE_ID": self.get('tid') or "BCUS12345",
                 "CATEGORY": self.CATEGORIES[self.cat_var.get()],
@@ -1078,9 +1141,19 @@ class RepackDialog(ctk.CTkToplevel):
                 "PARENTAL_LEVEL": self.to_int('par'),
                 "RESOLUTION": self.flags('resolution'),
                 "SOUND_FORMAT": self.flags('sound'),
-            }, Path(src))
+            }
 
-        self.app.start_repack(Path(src), tpl, settings, Path(out), content_id)
+        if tpl is not None:
+            template_sfo = read_template(Path(tpl))['sfo_data']
+            if template_sfo is None:
+                raise ValueError("The selected template PKG does not contain PARAM.SFO.")
+
+            generated_sfo = self.create_sfo(sfo_parameters, None, template_sfo)
+
+        elif self.param_var.get():
+            self.create_sfo(sfo_parameters, Path(src))
+
+        self.app.start_repack(Path(src), tpl, settings, Path(out), generated_sfo, content_id)
         self.destroy()
 
 class App(ctk.CTk):
@@ -1179,19 +1252,21 @@ class App(ctk.CTk):
             return
         RepackDialog(self)
 
-    def start_repack(self, src, tpl, settings, out, content_id=None):
+    def start_repack(self, src, tpl, settings, out, generated_sfo=None, content_id=None):
         self.cancel_flag.clear()
         self.repack_btn.configure(state='disabled')
         self.cancel_btn.configure(state='normal')
         self.progress.set(0)
-        threading.Thread(target=self.repack_worker, args=(src, tpl, settings, out), daemon=True).start()
+        threading.Thread(target=self.repack_worker,
+                         args=(src, tpl, settings, out, generated_sfo, content_id),daemon=True).start()
 
-    def repack_worker(self, src, tpl, settings, out, content_id=None):
+    def repack_worker(self, src, tpl, settings, out, generated_sfo=None, content_id=None):
         try:
             self.enqueue_log(f"\nRepackaging {src} -> {out}\n")
             repack_pkg(src, tpl, out, settings=settings,
-                    progress_cb=lambda d, t: self.after(0, self.progress.set, d / t),
-                    log_cb=self.enqueue_log, cancel_flag=self.cancel_flag,)
+                progress_cb=lambda d, t: self.after(0, self.progress.set, d / t),
+                log_cb=self.enqueue_log, cancel_flag=self.cancel_flag,
+                content_id=content_id, generated_sfo=generated_sfo)
             ok, msg = verify_pkg_hash(out)
             self.enqueue_log(f"\nDone. Verify: {msg}\n")
             self.set_status("Repack complete." if ok else "Repack finished with a hash problem.")
@@ -1201,7 +1276,7 @@ class App(ctk.CTk):
             self.enqueue_log(f"\nREPACK FAILED: {exc}\n")
         finally:
             self.after(0, lambda: (self.repack_btn.configure(state='normal'),
-                                self.cancel_btn.configure(state='disabled')))
+                self.cancel_btn.configure(state='disabled')))
 
     def enqueue_log(self, msg: str):
         self._log_queue.put(msg)
