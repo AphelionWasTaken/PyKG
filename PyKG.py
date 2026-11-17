@@ -5,6 +5,7 @@ import sys
 import struct
 import threading
 import hashlib
+import traceback
 import customtkinter as ctk
 from tkinter import PhotoImage, filedialog
 from dataclasses import dataclass
@@ -24,7 +25,6 @@ except ImportError:
 PKG_MAGIC = b'\x7fPKG'
 PKG_TYPE_PS3 = 0x0001
 PKG_RELEASE_TYPE_DEBUG = 0x0000
-PKG_RELEASE_TYPE_RELEASE = 0x8000
 PS3_NPDRM_KEY = bytes.fromhex('2e7b71d7c9c9a14ea3221f188828b8f8')
 FLAG_DIR = 0x04
 ITEM_RECORD_SIZE = 0x20
@@ -82,57 +82,16 @@ def read_header(f) -> dict:
         'meta_count': meta_count,
     }
 
-def get_debug_keystream_block(qa_digest: bytes, block_index: int) -> bytes:
-    qa_0 = qa_digest[0:8]
-    qa_1 = qa_digest[8:16]
-    buffer = bytearray(64)
-    buffer[0:8] = qa_0
-    buffer[8:16] = qa_0
-    buffer[16:24] = qa_1
-    buffer[24:32] = qa_1
-    buffer[56:64] = struct.pack(">Q", block_index)
-
-    return hashlib.sha1(buffer).digest()[:16]
-
-def make_aes_ctr(iv: bytes, stream_byte_offset: int):
-    block_index = stream_byte_offset // 16
-    iv_int = int.from_bytes(iv, 'big')
-    ctr_val = (iv_int + block_index) & ((1 << 128) - 1)
-    ctr = Counter.new(128, initial_value=ctr_val)
-
-    return AES.new(PS3_NPDRM_KEY, AES.MODE_CTR, counter=ctr)
-
-def decrypt_region(f, hdr: dict, stream_pos: int, size: int) -> bytes:
+def decrypt_region(f, hdr, stream_pos, size):
     if size == 0:
         return b''
-
-    data_offset = hdr['data_offset']
-    release_type = hdr['release_type']
     block_start = stream_pos & ~0xF
     prefix_len = stream_pos - block_start
-    num_bytes = prefix_len + size
-    num_blocks = (num_bytes + 15) // 16
-
-    f.seek(data_offset + block_start)
-    enc = f.read(num_blocks * 16)
-
-    if release_type == PKG_RELEASE_TYPE_DEBUG:
-        qa_digest = hdr['qa_digest']
-        block_index = block_start // 16
-        plaintext = bytearray()
-        chunks = (enc[offset:offset + 16] for offset in range(0, len(enc), 16))
-        for i, chunk in enumerate(chunks):
-            keystream = get_debug_keystream_block(qa_digest, block_index + i)
-            plaintext.extend(a ^ b for a, b in zip(chunk, keystream))
-        return bytes(plaintext)[prefix_len : prefix_len + size]
-    else:
-        iv = hdr['iv']
-        iv_int = int.from_bytes(iv, 'big')
-        ctr_val = (iv_int + block_start // 16) & ((1 << 128) - 1)
-        ctr = Counter.new(128, initial_value=ctr_val)
-        cipher = AES.new(PS3_NPDRM_KEY, AES.MODE_CTR, counter=ctr)
-        plaintext = cipher.decrypt(enc)
-        return plaintext[prefix_len : prefix_len + size]
+    f.seek(hdr['data_offset'] + block_start)
+    enc = f.read((prefix_len + size + 15) & ~0xF)
+    got = len(enc)
+    plain = crypt_stream(hdr, enc + bytes(-got % 16), block_start)
+    return plain[prefix_len:min(prefix_len + size, got)]
 
 def parse_sfo(data: bytes) -> dict | None:
     if data[:4] != b'\0PSF':
@@ -187,32 +146,23 @@ def parse_version(v: str) -> tuple:
     return tuple(cleaned)
 
 def find_title_id_and_version(f, items, hdr, log):
-    for (name_off, name_size, item_data_off, item_data_size, flags) in items:
-        if name_size == 0 or item_data_size == 0:
+    for name, d_off, d_size, _ in items:
+        if d_size == 0 or not name.upper().endswith('PARAM.SFO'):
             continue
 
-        raw_name = decrypt_region(f, hdr, name_off, name_size)
-        name = raw_name.rstrip(b'\x00').decode('utf-8', errors='replace')
+        info = parse_sfo(decrypt_region(f, hdr, d_off, d_size))
+        if info:
+            tid, ver, title = info.get('TITLE_ID'), info.get('APP_VER'), info.get('TITLE', '')
 
-        if name.upper().endswith('PARAM.SFO'):
-            sfo_data = decrypt_region(f, hdr, item_data_off, item_data_size)
-            info = parse_sfo(sfo_data)
-            if info:
-                tid = info.get('TITLE_ID')
-                ver = info.get('APP_VER')
-                title = info.get('TITLE', '')
+            log(f"TITLE: {title}\n")
+            log(f"TITLE_ID: {tid}\n")
+            log(f"APP_VER: {ver}\n")
 
-                log(f"TITLE: {title}\n")
-                log(f"TITLE_ID: {tid}\n")
-                log(f"APP_VER: {ver}\n")
-
-                return tid, ver, title
+            return tid, ver, title
     log("ERROR: PARAM.SFO DOES NOT CONTAIN ONE OF THE FOLLOWING: TITLE_ID or APP_VER")
     return None, None, None
 
-
 def verify_pkg_hash(pkg_path: Path, log_cb=None) -> tuple[bool, str]:
-    CHUNK = 512 * 1024
     try:
         file_size = pkg_path.stat().st_size
     except OSError as e:
@@ -227,7 +177,7 @@ def verify_pkg_hash(pkg_path: Path, log_cb=None) -> tuple[bool, str]:
         with open(pkg_path, 'rb') as f:
             remaining = body_size
             while remaining > 0:
-                chunk = f.read(min(CHUNK, remaining))
+                chunk = f.read(min(CRYPT_CHUNK, remaining))
                 if not chunk:
                     break
                 h.update(chunk)
@@ -271,6 +221,15 @@ def resolve_folder_name(f, hdr: dict, sfo_title_id: str | None) -> str | None:
             return candidate
     return None
 
+def read_items(f, hdr):
+    table = decrypt_region(f, hdr, 0, hdr['item_count'] * ITEM_RECORD_SIZE)
+    items = []
+    for i in range(hdr['item_count']):
+        n_off, n_size, d_off, d_size, flags, _ = struct.unpack_from(ITEM_FMT, table, i * ITEM_RECORD_SIZE)
+        name = decrypt_region(f, hdr, n_off, n_size).rstrip(b'\0').decode('utf-8', 'replace') if n_size else ''
+        items.append((name, d_off, d_size, flags))
+    return items
+
 def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) -> str:
     def log(msg: str):
         if log_cb:
@@ -284,27 +243,10 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
         log(f"CONTENT-ID: {content_id}\n")
         log(f"ITEMS: {item_count}\n")
 
-        table_raw = decrypt_region(f, hdr, 0, item_count * ITEM_RECORD_SIZE)
-
-        items = []
-        for i in range(item_count):
-            rec = table_raw[i * ITEM_RECORD_SIZE: (i + 1) * ITEM_RECORD_SIZE]
-            name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
-            items.append((name_off, name_size, item_data_off, item_data_size, flags))
-
-        sfo_title_id, app_ver, title = find_title_id_and_version(f, items, hdr, log)
-
+        items = read_items(f, hdr)
+        sfo_title_id, _, _ = find_title_id_and_version(f, items, hdr, log)
         title_id = resolve_folder_name(f, hdr, sfo_title_id)
-
-        raw_names = []
-        for (name_off, name_size, _, _, _) in items:
-            if name_size > 0:
-                raw = decrypt_region(f, hdr, name_off, name_size)
-                raw_names.append(raw.rstrip(b'\x00').decode('utf-8', errors='replace'))
-            else:
-                raw_names.append('')
-
-        path_pkg = is_path_pkg(raw_names)
+        path_pkg = is_path_pkg([name for name, *_ in items])
         if path_pkg:
             log("Detected pypkg path-traversal PKG — using virtual PS3 root extraction.\n")
 
@@ -313,18 +255,15 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
                             "If this is a DLC PKG, the install-folder metadata was not found.")
         title_id = title_id or ''
 
-        CHUNK = 512 * 1024
-
-        for index, ((name_off, name_size, item_data_off, item_data_size, flags), name) in enumerate(zip(items, raw_names)):
-            if name_size == 0:
+        for index, (name, item_data_off, item_data_size, flags) in enumerate(items):
+            if not name:
                 if progress_cb:
                     progress_cb(index + 1, item_count)
                 continue
+            if name in ('.', '..'):
+                continue
 
             is_dir = bool(flags & FLAG_DIR)
-
-            if not name or name in ('.', '..'):
-                continue
 
             if path_pkg:
                 dest = resolve_path_pkg_dest(name, dest_root)
@@ -348,7 +287,7 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
                 written = 0
                 with open(dest, "wb") as out:
                     while written < item_data_size:
-                        chunk_size = min(CHUNK, item_data_size - written)
+                        chunk_size = min(CRYPT_CHUNK, item_data_size - written)
                         data = decrypt_region(f, hdr, item_data_off + written, chunk_size)
                         if not data:
                             raise IOError("Unexpected EOF while decrypting")
@@ -362,6 +301,21 @@ def extract_pkg(pkg_path: Path, dest_root: Path, progress_cb=None, log_cb=None) 
 
     return title_id
 
+def debug_keystream(key16: bytes, first_block: int, nbytes: int) -> bytes:
+    n = (nbytes + 15) // 16
+    buf = bytearray(64)
+    buf[0:8] = buf[8:16] = key16[0:8]
+    buf[16:24] = buf[24:32] = key16[8:16]
+    out = bytearray(n * 16)
+    sha1, pack_into = hashlib.sha1, struct.pack_into
+    for i in range(n):
+        pack_into('>Q', buf, 56, first_block + i)
+        out[i * 16:(i + 1) * 16] = sha1(buf).digest()[:16]
+    return bytes(out[:nbytes])
+
+def get_debug_keystream_block(key16: bytes, block_index: int) -> bytes:
+    return debug_keystream(key16, block_index, 16)
+
 def crypt_stream(hdr: dict, data: bytes, stream_pos: int) -> bytes:
     if stream_pos % 16 or len(data) % 16:
         raise ValueError("crypt_stream needs 16-byte aligned position and length")
@@ -370,30 +324,18 @@ def crypt_stream(hdr: dict, data: bytes, stream_pos: int) -> bytes:
     block_index = stream_pos // 16
 
     if hdr['release_type'] == PKG_RELEASE_TYPE_DEBUG:
-        qa = hdr['qa_digest']
-        buf = bytearray(64)
-        buf[0:8] = buf[8:16] = qa[0:8]
-        buf[16:24] = buf[24:32] = qa[8:16]
-        keystream = bytearray(len(data))
-        sha1, pack_into = hashlib.sha1, struct.pack_into
-        for i in range(len(data) // 16):
-            pack_into('>Q', buf, 56, block_index + i)
-            keystream[i * 16:i * 16 + 16] = sha1(buf).digest()[:16]
+        keystream = debug_keystream(hdr['qa_digest'], block_index, len(data))
         return (int.from_bytes(data, 'big') ^ int.from_bytes(keystream, 'big')).to_bytes(len(data), 'big')
 
     ctr_val = (int.from_bytes(hdr['iv'], 'big') + block_index) & ((1 << 128) - 1)
     ctr = Counter.new(128, initial_value=ctr_val, allow_wraparound=True)
     return AES.new(PS3_NPDRM_KEY, AES.MODE_CTR, counter=ctr).encrypt(data)
 
-def _debug_keystream(key16: bytes, nbytes: int) -> bytes:
-    n = (nbytes + 15) // 16
-    return b''.join(get_debug_keystream_block(key16, i) for i in range(n))[:nbytes]
-
 def debug_digest_blocks(header: bytes, meta_packets: bytes) -> tuple[bytes, bytes]:
     hdr_sha = hashlib.sha1(header).digest()[3:19]
     meta_sha = hashlib.sha1(meta_packets).digest()[3:19]
-    pad_enc = _debug_keystream(meta_sha, 0x30)
-    pad_enc2 = bytes(a ^ b for a, b in zip(pad_enc, _debug_keystream(hdr_sha, 0x30)))
+    pad_enc = debug_keystream(meta_sha, 0, 0x30)
+    pad_enc2 = bytes(a ^ b for a, b in zip(pad_enc, debug_keystream(hdr_sha, 0, 0x30)))
     return hdr_sha + pad_enc2, meta_sha + pad_enc
 
 def read_template(tpl_path: Path) -> dict:
@@ -407,18 +349,12 @@ def read_template(tpl_path: Path) -> dict:
         f.seek(meta_off)
         meta_blob = f.read(data_off - meta_off)
 
-        table = decrypt_region(f, hdr, 0, item_count * ITEM_RECORD_SIZE)
-        order, flags_by_name = [], {}
-        template_sfo = None
-        for i in range(item_count):
-            rec = table[i * ITEM_RECORD_SIZE:(i + 1) * ITEM_RECORD_SIZE]
-            n_off, n_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
-            name = decrypt_region(f, hdr, n_off, n_size).rstrip(b'\0').decode('utf-8', 'replace')
-            order.append(name)
-            flags_by_name[name] = flags
-
-            if name.upper() == "PARAM.SFO":
-                template_sfo = decrypt_region(f, hdr, item_data_off, item_data_size)
+        items = read_items(f, hdr)
+        order = [name for name, *_ in items]
+        flags_by_name = {name: flags for name, _, _, flags in items}
+        template_sfo = next((decrypt_region(f, hdr, off, size)
+                            for name, off, size, _ in items
+                            if name.upper() == "PARAM.SFO"), None)
 
     return dict(scratch=False, revision=revision, pkg_type=pkg_type, meta_off=meta_off,
                 meta_cnt=meta_cnt, meta_size=meta_size, total_size=total_size,
@@ -488,6 +424,21 @@ def _pack_hdr(revision, pkg_type, tpl, n_items, total, data_size, content_id_raw
     return struct.pack(HDR_FMT, PKG_MAGIC, revision, pkg_type, tpl['meta_off'], tpl['meta_cnt'],
                        tpl['meta_size'], n_items, total, tpl['data_off'], data_size,
                        content_id_raw, digest, riv)
+
+def item_chunks(name, path, size, generated_sfo):
+    if path is None:
+        yield generated_sfo
+        return
+    read = 0
+    with open(path, 'rb') as src:
+        while read < size:
+            chunk = src.read(min(CRYPT_CHUNK, size - read))
+            if not chunk:
+                raise IOError(f"'{name}' shrank while packing")
+            read += len(chunk)
+            if len(chunk) % 16 and read < size:
+                raise IOError(f"short read on '{name}'")
+            yield chunk
 
 def repack_pkg(src_dir: Path, template_pkg: Path | None, out_pkg: Path, settings: PkgSettings | None = None,
                progress_cb=None, log_cb=None, cancel_flag=None, content_id: str | None = None,
@@ -568,20 +519,11 @@ def repack_pkg(src_dir: Path, template_pkg: Path | None, out_pkg: Path, settings
         for (name, path, is_dir), size in zip(items, sizes):
             if is_dir:
                 continue
-            if path is None:
-                qa.update(generated_sfo)
-                tick(len(generated_sfo))
-                continue
-
-            with open(path, 'rb') as src:
-                while True:
-                    if cancel_flag is not None and cancel_flag.is_set():
-                        raise InterruptedError("Cancelled")
-                    chunk = src.read(CRYPT_CHUNK)
-                    if not chunk:
-                        break
-                    qa.update(chunk)
-                    tick(len(chunk))
+            for chunk in item_chunks(name, path, size, generated_sfo):
+                if cancel_flag is not None and cancel_flag.is_set():
+                    raise InterruptedError("Cancelled")
+                qa.update(chunk)
+                tick(len(chunk))
         qa.update(_pack_hdr(revision, tpl['pkg_type'], tpl, len(items), total_size, data_size,
                             bytes(0x30), bytes(16), bytes(16)))
         qa.update(table_blob)
@@ -602,12 +544,11 @@ def repack_pkg(src_dir: Path, template_pkg: Path | None, out_pkg: Path, settings
             raise ValueError("Unexpected metadata layout in template.")
         meta_packets = bytes(blob[:-PKG_DIGEST_BLOCK])
 
-    rtlDigestBlockHdr = bytes(PKG_DIGEST_BLOCK - 8) + hashlib.sha1(new_hdr).digest()[-8:]
-    rtlDigestBlockMeta = bytes(PKG_DIGEST_BLOCK - 8) + hashlib.sha1(meta_packets).digest()[-8:]
-
     if debug:
         hdr_digest, meta_digest = debug_digest_blocks(new_hdr, meta_packets)
     else:
+        rtlDigestBlockHdr = bytes(PKG_DIGEST_BLOCK - 8) + hashlib.sha1(new_hdr).digest()[-8:]
+        rtlDigestBlockMeta = bytes(PKG_DIGEST_BLOCK - 8) + hashlib.sha1(meta_packets).digest()[-8:]
         hdr_digest, meta_digest = rtlDigestBlockHdr, rtlDigestBlockMeta
 
     crypto_hdr = dict(release_type=revision, iv=riv, qa_digest=qa_digest)
@@ -639,25 +580,12 @@ def repack_pkg(src_dir: Path, template_pkg: Path | None, out_pkg: Path, settings
             for (name, path, is_dir), size in zip(items, sizes):
                 if is_dir:
                     continue
-                if cancel_flag is not None and cancel_flag.is_set():
-                    raise InterruptedError("Cancelled")
                 log(f"PACKING FILE: {name} ({size / 1024:,.1f} KB)\n")
-                if path is None:
-                    emit_plain(generated_sfo)
-                    tick(len(generated_sfo))
-                    continue
-
-                written = 0
-                with open(path, 'rb') as src:
-                    while written < size:
-                        chunk = src.read(min(CRYPT_CHUNK, size - written))
-                        if not chunk:
-                            raise IOError(f"'{name}' shrank while packing")
-                        if len(chunk) % 16 and written + len(chunk) < size:
-                            raise IOError(f"short read on '{name}'")
-                        emit_plain(chunk)
-                        written += len(chunk)
-                        tick(len(chunk))
+                for chunk in item_chunks(name, path, size, generated_sfo):
+                    if cancel_flag is not None and cancel_flag.is_set():
+                        raise InterruptedError("Cancelled")
+                    emit_plain(chunk)
+                    tick(len(chunk))
 
             if stream_pos != data_size:
                 raise ValueError(f"Internal layout error: wrote {stream_pos:#x}, expected {data_size:#x}")
@@ -1105,11 +1033,12 @@ class RepackDialog(ctk.CTkToplevel):
             return
 
         if self.mode_var.get() == 'template':
-            tpl = self.get('tpl')
-            if not tpl or not Path(tpl).is_file():
+            tpl_str = self.get('tpl')
+            if not tpl_str or not Path(tpl_str).is_file():
                 log("Pick a template PKG, or switch to Custom PKG.\n")
                 return
-            if Path(tpl).resolve() == Path(out).resolve():
+            tpl = Path(tpl_str)
+            if tpl.resolve() == Path(out).resolve():
                 log("Output can't overwrite the template.\n")
                 return
             content_id = self.get('cid').upper() or None
@@ -1117,7 +1046,7 @@ class RepackDialog(ctk.CTkToplevel):
                 log("Content ID must look like 'UP0001-BLUS30001_00-MYUPDATE00000000' "
                     "(6 chars - 9 chars _ 2 digits - 16 chars)\n")
                 return
-            tpl, settings = Path(tpl), None
+            settings = None
         else:
             ctype, flags = self.TYPES[self.type_var.get()]
             tpl = None
@@ -1144,7 +1073,7 @@ class RepackDialog(ctk.CTkToplevel):
             }
 
         if tpl is not None:
-            template_sfo = read_template(Path(tpl))['sfo_data']
+            template_sfo = read_template(tpl)['sfo_data']
             if template_sfo is None:
                 raise ValueError("The selected template PKG does not contain PARAM.SFO.")
 
@@ -1370,12 +1299,7 @@ class App(ctk.CTk):
             try:
                 with open(pkg, 'rb') as f:
                     hdr = read_header(f)
-                    table_raw = decrypt_region(f, hdr, 0, hdr['item_count'] * ITEM_RECORD_SIZE)
-                    items = []
-                    for j in range(hdr['item_count']):
-                        rec = table_raw[j * ITEM_RECORD_SIZE:(j + 1) * ITEM_RECORD_SIZE]
-                        name_off, name_size, item_data_off, item_data_size, flags, _ = struct.unpack(ITEM_FMT, rec)
-                        items.append((name_off, name_size, item_data_off, item_data_size, flags))
+                    items = read_items(f, hdr)
                     sfo_tid, version, title = find_title_id_and_version(f, items, hdr, lambda x: None)
                     tid = resolve_folder_name(f, hdr, sfo_tid)
                     self._pkg_meta[pkg] = (title or 'UNKNOWN', tid or 'UNKNOWN', version or '0.00', parse_version(version or '0.00'))
@@ -1481,7 +1405,6 @@ class App(ctk.CTk):
                 ok = ok + 1
 
             except Exception as exc:
-                import traceback
                 self.enqueue_log(f"\nFAILED: {exc}\n")
                 self.enqueue_log(traceback.format_exc() + "\n")
                 fail = fail + 1
@@ -1492,8 +1415,8 @@ class App(ctk.CTk):
         self.enqueue_log(f"\n{'─' * 56}\n{summary}\n")
 
         self.set_status(summary)
-        self.after(0, self.extract_btn.configure, {'state': 'normal'})
-        self.after(0, self.cancel_btn.configure, {'state': 'disabled'})
+        self.after(0, lambda: self.extract_btn.configure(state='normal'))
+        self.after(0, lambda: self.cancel_btn.configure(state='disabled'))
 
     def clear_list(self):
         for w in self.list_frame.winfo_children():
@@ -1519,7 +1442,7 @@ class App(ctk.CTk):
         return hash_label, meta_label
 
     def set_status(self, msg: str):
-        self.after(0, self.status_lbl.configure, {'text': msg})
+        self.after(0, lambda: self.status_lbl.configure(text=msg))
 
 if __name__ == '__main__':
     App().mainloop()
