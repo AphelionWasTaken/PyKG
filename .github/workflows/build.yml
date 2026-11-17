@@ -176,12 +176,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: v0.1.4
-          name: v0.1.4
+          tag_name: v0.1.5
+          name: v0.1.5
           body: |
-            Ensure that the template PKG's PARAM.SFO metadata is correctly passed to the output PKG.
-
-            Previously, SFO items' allocated sizes were not being respected, creating a malformed SFO. The resulting PKG would work with RPCS3, but not on a PlayStation 3.
+            Reasonably large refactor. No functional changes.
+            
+            Cleanup redundancies, unused variables, and some minor UI bugs in the code.
           draft: false
           prerelease: false
           files: |
