@@ -47,6 +47,8 @@ If you are making a PKG type that requires a PARAM.SFO and you do not have one a
 
 Select the output folder for the PKG file and hit "Repackage" to being creating the PKG.
 
+**Please note that homebrew game PKGs have not been tested and likely need some handling for their eboots which does not exist in PyKG at this time.**
+
 Building PyKG
 ============
 PyKG does not need to be "built". Releases are created via PyInstaller. If you would rather run this directly from the source code, this program requires [Python 3](https://www.python.org/downloads/). It is included with most Linux Distros, although you may need to upgrade to a more recent version.
